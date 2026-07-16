@@ -26,6 +26,17 @@ RUN apt-get update -y && \
     libdrm-dev \
     libpci-dev \
     libglib2.0-dev libegl-dev libgles-dev libopengl-dev \
+    gpgv \
+    gnupg \
+    ca-certificates \
+    libxcb-cursor0 \
+    libxcb-xinerama0 \
+    libxcb-icccm4 \
+    libxcb-image0 \
+    libxcb-keysyms1 \
+    libxcb-randr0 \
+    libxcb-render-util0 \
+    libxcb-shape0 \
     && rm -rf /var/lib/apt/lists/*
 
 ## Install Rust in order to build our custom compositor
