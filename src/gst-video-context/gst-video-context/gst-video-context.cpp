@@ -9,6 +9,54 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <vector>
+#include <dlfcn.h>
+
+namespace {
+// Minimal local declarations of the real NVIDIA CUDA Driver API surface we need.
+// These are NOT provided by GStreamer's gst/cuda/* wrapper headers, which only
+// expose the subset of functions GStreamer's own nvcodec plugin uses internally.
+// We resolve the real symbols at runtime from libcuda.so.1, which is supplied by
+// the NVIDIA driver mounted into the container (the same library gst_cuda_load_library()
+// already dlopen()s internally) -- this avoids adding a CUDA toolkit build dependency.
+
+  using CUresult_local = int;
+  using CUdevice_local = int;
+  constexpr CUresult_local CUDA_SUCCESS_LOCAL = 0;
+
+  using cuInit_fn = CUresult_local (*)(unsigned int);
+  using cuDeviceGetByPCIBusId_fn = CUresult_local (*)(CUdevice_local *, const char *);
+  using cuDeviceGetName_fn = CUresult_local (*)(char *, int, CUdevice_local);
+
+  struct CudaDriverApi {
+    void *handle = nullptr;
+    cuInit_fn cuInit = nullptr;
+    cuDeviceGetByPCIBusId_fn cuDeviceGetByPCIBusId = nullptr;
+    cuDeviceGetName_fn cuDeviceGetName = nullptr;
+    bool ok = false;
+  };
+
+
+  const CudaDriverApi &get_cuda_driver_api() {
+    static CudaDriverApi api = [] {
+      CudaDriverApi a;
+      a.handle = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
+      if (!a.handle) {
+        logs::log(logs::warning, "dlopen(libcuda.so.1) failed: {}", dlerror());
+        return a;
+      }
+      a.cuInit = reinterpret_cast<cuInit_fn>(dlsym(a.handle, "cuInit"));
+      a.cuDeviceGetByPCIBusId =
+          reinterpret_cast<cuDeviceGetByPCIBusId_fn>(dlsym(a.handle, "cuDeviceGetByPCIBusId"));
+      a.cuDeviceGetName = reinterpret_cast<cuDeviceGetName_fn>(dlsym(a.handle, "cuDeviceGetName"));
+      a.ok = a.cuInit && a.cuDeviceGetByPCIBusId && a.cuDeviceGetName;
+      if (!a.ok) {
+        logs::log(logs::warning, "Failed to resolve one or more CUDA driver symbols via dlsym");
+      }
+      return a;
+    }();
+    return api;
+  }
+}
 
 namespace gst_video_context {
 
@@ -66,36 +114,31 @@ bool isNvidiaGpu(const std::string &pciBusId) {
 }
 
 std::optional<int> getCudaDeviceIndexFromPciBusId(const std::string &pciBusId) {
-  CUresult result;
-
-  result = cuInit(0);
-  if (result != CUDA_SUCCESS) {
-    logs::log(logs::warning, "cuInit() failed");
+  const auto &cuda = get_cuda_driver_api();
+  if (!cuda.ok) {
+    logs::log(logs::warning, "CUDA driver API not available, cannot resolve PCI bus ID {}", pciBusId);
     return std::nullopt;
   }
 
-  CUdevice device;
-  result = cuDeviceGetByPCIBusId(&device, pciBusId.c_str());
-
-  if (result != CUDA_SUCCESS) {
-    logs::log(logs::warning,
-              "Unable to find CUDA device for PCI bus ID {}",
-              pciBusId);
+  CUresult_local result = cuda.cuInit(0);
+  if (result != CUDA_SUCCESS_LOCAL) {
+    logs::log(logs::warning, "cuInit() failed with code {}", result);
     return std::nullopt;
   }
 
-  int ordinal = static_cast<int>(device);
+  CUdevice_local device = -1;
+  result = cuda.cuDeviceGetByPCIBusId(&device, pciBusId.c_str());
+  if (result != CUDA_SUCCESS_LOCAL) {
+    logs::log(logs::warning, "Unable to find CUDA device for PCI bus ID {}", pciBusId);
+    return std::nullopt;
+  }
 
   char name[256] = {};
-  cuDeviceGetName(name, sizeof(name), device);
+  cuda.cuDeviceGetName(name, sizeof(name), device);
 
-  logs::log(logs::info,
-            "PCI {} -> CUDA ordinal {} ({})",
-            pciBusId,
-            ordinal,
-            name);
+  logs::log(logs::info, "PCI {} -> CUDA ordinal {} ({})", pciBusId, device, name);
 
-  return ordinal;
+  return static_cast<int>(device);
 }
 
 std::optional<int> getCudaDeviceFromDri(const fs::path &driPath) {
